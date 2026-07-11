@@ -1,0 +1,19 @@
+{
+  "name": "veryviolet",
+  "interface": {
+    "displayName": "echelon3"
+  },
+  "plugins": [
+    {
+      "name": "echelon3",
+      "source": {
+        "source": "local",
+        "path": "./plugins/echelon3"
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

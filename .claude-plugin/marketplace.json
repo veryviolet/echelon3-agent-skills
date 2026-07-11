@@ -1,0 +1,14 @@
+{
+  "name": "veryviolet",
+  "owner": {
+    "name": "veryviolet"
+  },
+  "description": "echelon3 \u2014 config-driven PyTorch training plugins.",
+  "plugins": [
+    {
+      "name": "echelon3",
+      "source": "./plugins/echelon3",
+      "description": "echelon3 \u2014 config-driven PyTorch training."
+    }
+  ]
+}
