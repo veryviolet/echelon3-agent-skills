@@ -43,9 +43,9 @@ via `module: my_pkg.nets.foo`).
 ```bash
 echelon3 train    --config-dir configs --config-name my_experiment [overrides...]
 echelon3 finetune --config-dir configs --config-name my_experiment [overrides...]
+echelon3 run      --config-dir configs --config-name my_experiment [overrides...]
 echelon3 evaluate --config-dir configs --config-name my_experiment [overrides...]
 echelon3 export   --config-dir configs --config-name my_experiment [overrides...]
-echelon3 run      --config-dir configs --config-name my_experiment [overrides...]
 ```
 
 - `--config-dir` / `-cd`: directory of the config (default: current dir).
@@ -152,11 +152,12 @@ echelon3 train -cd . -cn fmnist device=cpu
 `key=value` positionals override config values (dotted paths, OmegaConf-typed):
 
 ```bash
+# key=value overrides a value; +key=value adds one (key= also adds); ~key deletes one.
 echelon3 train -cd configs -cn my_experiment \
     trainer.config.epochs=200 optimizer.config.lr=5e-5 \
     dataloaders.train.config.batch_size=256 \
-    +trainer.config.compile=true \   # + adds a key (optional; key= also adds)
-    ~scheduler                        # ~ deletes a key/section
+    +trainer.config.compile=true \
+    ~scheduler
 ```
 
 Types infer: `epochs=200`→int, `lr=5e-5`→float, `compile=true`→bool, `x=null`→None,
