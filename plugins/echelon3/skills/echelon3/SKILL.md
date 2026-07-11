@@ -16,6 +16,24 @@ pip install echelon3
 # extras: echelon3[export] (ONNX), echelon3[smp], echelon3[detection], echelon3[test]
 ```
 
+## Rules agents get wrong — read first
+
+1. **Every component is three keys `module` + `type` + `config`** — NOT a single
+   dotted `name:`. echelon3 does `getattr(import_module(module), type)(**config)`.
+   ```yaml
+   net: { module: my_pkg.nets.my_net, type: MyNet, config: { channels: 32 } }   # RIGHT
+   # net: { name: my_pkg.nets.my_net.MyNet, config: {} }                          # WRONG
+   ```
+2. **The CLI takes `--config-dir`/`-cd` + `--config-name`/`-cn`, not a YAML path:**
+   ```bash
+   echelon3 train -cd . -cn my_experiment device=cpu    # RIGHT
+   # echelon3 train my_experiment.yaml --device cpu      # WRONG
+   ```
+3. `loss:` and `metrics:` are **lists** of `- name: { module, type, config, weight }`.
+   `target:` is `{ path: ..., checkpoints_to_keep: ... }` (NOT under a `config:` block).
+   `trainer:` also needs `module` + `type` + `config` (`echelon3.trainers.baseline` /
+   `Trainer`).
+
 ## CLI
 
 One executable, `echelon3`, with a subcommand per task. Run it from your repo root
@@ -73,6 +91,61 @@ Optional sections: `transform`, `metrics`, `scheduler`, `mlops`, `gpus`,
 `keep_best_on`. Required: `data`, `dataloaders`, `net`, `loss`, `optimizer`,
 `trainer`, `target`. Every component needs its `config:` block (`config: {}` if the
 constructor takes no args).
+
+## Complete minimal example (verified end-to-end — copy and adapt)
+
+Three files in one directory train a FashionMNIST classifier. Copy the exact shapes.
+
+`fmnist_net.py`
+```python
+import torch.nn as nn
+class FashionMNISTNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(), nn.Linear(32, 10))
+    def forward(self, x):
+        return self.layers(x)
+```
+
+`fmnist_data.py`  (a dataset is a component; __init__ MUST accept augment/preprocess)
+```python
+import numpy as np, torch
+from torch.utils.data import Dataset
+from torchvision.datasets import FashionMNIST
+class FashionMNISTData(Dataset):
+    def __init__(self, split="train", limit=None, augment=None, preprocess=None):
+        self.ds = FashionMNIST(root="./mnist", download=True, train=(split == "train"))
+        self.n = len(self.ds) if limit is None else min(limit, len(self.ds))
+    def __len__(self):
+        return self.n
+    def __getitem__(self, i):
+        img, label = self.ds[i]
+        return torch.from_numpy(np.array(img)).float().unsqueeze(0) / 255.0, int(label)
+```
+
+`fmnist.yaml`  (note the exact shape of loss=list, trainer/target wrappers)
+```yaml
+net: { module: fmnist_net, type: FashionMNISTNet, config: {} }
+data:
+  train: { module: fmnist_data, type: FashionMNISTData, config: { split: train, limit: 512 } }
+  test:  { module: fmnist_data, type: FashionMNISTData, config: { split: test, limit: 256 } }
+dataloaders:
+  train: { module: torch.utils.data, type: DataLoader, config: { batch_size: 64, num_workers: 0, shuffle: true, drop_last: true } }
+  test:  { module: torch.utils.data, type: DataLoader, config: { batch_size: 64, num_workers: 0 } }
+loss:
+  - ce: { module: torch.nn, type: CrossEntropyLoss, config: {} }
+optimizer: { module: torch.optim, type: AdamW, config: { lr: 0.001 } }
+trainer: { module: echelon3.trainers.baseline, type: Trainer, config: { epochs: 1 } }
+target: { path: ./out, checkpoints_to_keep: 1 }
+```
+
+Run from that directory:
+```bash
+echelon3 train -cd . -cn fmnist device=cpu
+```
 
 ## CLI overrides
 
