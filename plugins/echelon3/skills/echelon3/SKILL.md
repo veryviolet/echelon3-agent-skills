@@ -78,7 +78,7 @@ trainer:
   type: Trainer
   config:
     epochs: 100
-    keep_best_on: { iou: { mode: directional, value: high } }   # optional
+    keep_best_on: { iou: { mode: directional, value: high } }   # optional; multi-metric = AND (see Gotchas)
     precision: auto            # auto|bf16|fp16|fp32 (auto = bf16 on capable GPUs)
     compile: false             # torch.compile
     times_to_validate_per_epoch: 1
@@ -236,5 +236,10 @@ Run `echelon3 <cmd>` from the repo root so `my_pkg` imports.
 - Under DDP, custom `echelon3.metrics.base.Metric` subclasses only see rank 0's shard
   for keep-best unless they implement `dist_reduce()` (SUM all-reduce of their
   counters); torchmetrics aggregate automatically.
+- `keep_best_on` with **several** metrics is combined with **AND**: a checkpoint is
+  saved only when **every** listed metric improves on the same validation — there is no
+  OR / weighted / priority mode, so multi-metric saves are rare. Each entry takes
+  `mode: directional` (`value: high|low`) or `mode: tolerance` (`value:` + `direction:`);
+  `metrics_on: { metric: test_set }` routes a metric to a specific test set.
 - Config loading is OmegaConf (not Hydra); `${oc.env:VAR,default}` works; `defaults:`
   composes and `hydra:` blocks are ignored.
