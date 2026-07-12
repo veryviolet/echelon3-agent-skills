@@ -182,10 +182,31 @@ Merged left-to-right; base configs may compose recursively.
 
 ## Common recipes
 
-- **Resume**: automatic — if `target.path` has checkpoints, training continues.
-- **Finetune**: `echelon3 finetune` + `init_from.checkpoint` (warm-start),
-  `finetune.freeze_patterns` (regex freeze), `finetune.head_only` /
-  `finetune.param_groups` (per-layer LRs).
+- **Resume (continue a run):** automatic — `echelon3 train` continues if `target.path`
+  already has checkpoints (optimizer + scheduler + epoch state are restored).
+- **Start a fresh run from existing weights (plain `train`, NOT finetune):** set
+  `net.weights: <ckpt>` plus a `weights_loader` component and run `echelon3 train`.
+  Only the weights are loaded; optimizer and scheduler start fresh, so LR warmup /
+  schedule run normally. This is the usual "init from a checkpoint and train" path.
+  ```yaml
+  net:
+    module: my_pkg.nets
+    type: MyNet
+    config: { ... }
+    weights: ./runs/base/checkpoint-40.tar   # triggers weight load in `echelon3 train`
+  weights_loader:                            # strict full load
+    module: echelon3.weightloaders.basic
+    type: WeightsLoader
+    config: {}
+    # tolerant partial load (name+shape match, strict=False):
+    # module: echelon3.weightloaders.partial
+    # type: PartialWeightsLoader
+    # config: { strip_prefix: "module." }    # optional: strip a key prefix
+  ```
+- **Finetune (only when you need freeze / per-layer LRs):** `echelon3 finetune` +
+  `init_from.checkpoint` (warm-start), `finetune.freeze_patterns` (regex freeze),
+  `finetune.head_only` / `finetune.param_groups`. If you just want to start from
+  weights, use plain `train` above.
 - **Evaluate**: `echelon3 evaluate` loads the latest checkpoint, runs `evaluator.metric`
   over `data.test`.
 - **Export ONNX**: `echelon3 export` runs the `export` section (preprocess→net→
