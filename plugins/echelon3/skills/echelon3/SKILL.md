@@ -211,6 +211,77 @@ At start echelon3 runs an **initial validation before training** (the step-0 / l
 checkpoint baseline the run must beat), then trains; each validation prints
 `--> Trained epoch N: …% …, lr=…, <losses>` and `--> Evaluated [set]: <losses, metrics>`.
 
+## Tabular / fit-predict models (the estimator path)
+
+For models that are **fit once, not trained by SGD** — gradient-boosted trees
+(CatBoost / XGBoost / LightGBM / sklearn) and tabular foundation models (TabPFN / TabICL /
+TabFM / TabGPT, all sklearn-compatible fit/predict) — echelon3 has a **separate trainer
+family**, still driven by `echelon3 train`.
+
+- **Route by section:** an estimator config has a **`model:`** section (and **no `net:`**);
+  a `net:` config is the image/SGD path. `echelon3 train` routes automatically.
+- **No `optimizer` / `loss` / `dataloaders` / `scheduler`.** The objective/loss is a
+  **hyperparameter of the model itself** (e.g. CatBoost `loss_function: Logloss`), set in
+  `model.config` — there is no separate `loss:` section. Swap engines by changing only the
+  `model:` block (share the rest via `defaults:`). The engine package
+  (`catboost`/`xgboost`/`lightgbm`) must be pip-installed; the sklearn models need nothing extra.
+
+Pieces (all in `echelon3` core):
+- **Data** — `echelon3.data.tabular.TabularDataset`: reads csv/parquet/feather/json/tsv, a
+  **SQL** connection (`source: sql`, `sql:`/`table:` + `connection:`), or an in-memory
+  `frame:`; returns the whole `(X, y)`. `target:` is a column name **or a list** (multi-target).
+- **Feature preprocessing** — optional **top-level** `feature_transform:` section (sibling of
+  `model`/`data`), fit on train / applied to test (no leakage) and saved into the bundle:
+  `feature_transform: { module: echelon3.data.tabular, type: TabularPreprocessor, config: { scale: true } }`.
+  `TabularPreprocessor` is a declarative sklearn `ColumnTransformer` (impute/scale numeric +
+  impute/encode categorical) — keeps engine-swap frictionless on categorical/NaN data (CatBoost
+  handles those natively and can skip it; LogReg/TabPFN need it).
+- **Trainer** — `echelon3.trainers.estimator.EstimatorTrainer` (single target) or
+  `MultiTargetEstimatorTrainer` (a **list** of targets → one cloned model per target, fit only on
+  rows where that target is present — NaN-masked; bundle `{target: model}`). `trainer.config`:
+  `keep_best_on`, `fit_kwargs`, `eval_set` (pass first test set to `model.fit`), `use_categorical`.
+  Note: here `keep_best_on` is **report-only** (a single fit → one saved bundle); it does **not**
+  gate/select a best checkpoint like the SGD path's `keep_best_on`.
+- **Metrics** — `echelon3.metrics.tabular`: classification AUC/Gini/KS/LogLoss/Accuracy and
+  regression MAE/RMSE/R2/SpearmanR/PearsonR (trainer feeds `predict_proba` for classifiers,
+  `predict` for regressors).
+- **Inference** — `echelon3.inference.tabular` `load_bundle(path)` + `predict(bundle, data)`; the
+  saved `.tar` bundle (model(s) + fitted feature_transform + feature names + target) is
+  self-contained and `predict` re-applies the feature pipeline. Multi-target → `{target: preds}`.
+
+```yaml
+model: { module: catboost, type: CatBoostClassifier,
+         config: { iterations: 500, depth: 6, loss_function: Logloss, eval_metric: AUC, verbose: false } }
+data:
+  train: { module: echelon3.data.tabular, type: TabularDataset, config: { path: train.csv, target: default } }
+  test:  { module: echelon3.data.tabular, type: TabularDataset, config: { path: test.csv,  target: default } }
+metrics:
+  - auc:  { module: echelon3.metrics.tabular, type: AUC,  config: {} }
+  - gini: { module: echelon3.metrics.tabular, type: Gini, config: {} }
+trainer: { module: echelon3.trainers.estimator, type: EstimatorTrainer, config: { keep_best_on: [auc] } }
+target: { path: ./out, checkpoints_to_keep: 1 }
+# echelon3 train -cd . -cn my_tabular device=cpu   (no optimizer/loss/dataloaders)
+```
+
+Multi-target (e.g. several endpoints at once) needs **both** a list `target:` and the
+multi-target trainer (regression metrics; one model per target):
+```yaml
+data:
+  train: { module: echelon3.data.tabular, type: TabularDataset, config: { path: train.csv, target: [LogD, KSOL, HLM_CLint] } }
+  test:  { module: echelon3.data.tabular, type: TabularDataset, config: { path: test.csv,  target: [LogD, KSOL, HLM_CLint] } }
+metrics:
+  - mae: { module: echelon3.metrics.tabular, type: MAE, config: {} }
+  - r2:  { module: echelon3.metrics.tabular, type: R2,  config: {} }
+trainer: { module: echelon3.trainers.estimator, type: MultiTargetEstimatorTrainer, config: {} }
+# + a top-level feature_transform: if the model needs numeric features (e.g. SmilesFeaturizer for SMILES)
+```
+
+**Molecular / ADMET** (SMILES → property) is this same tabular path; the cheminformatics pieces
+live in the **`echelon3_zoo`** package (`pip install "echelon3-zoo[molecular]"`, pulls rdkit):
+`echelon3_zoo.molecular.SmilesFeaturizer` (RDKit descriptors + Morgan, as a `feature_transform`)
+and `echelon3_zoo.molecular.MoleculeGraphDataset` + `echelon3_zoo.nets.mol_gcn.MolGCN` (a 2D GNN
+that runs on the ordinary SGD `Trainer`).
+
 ## Complete minimal example (verified end-to-end — copy and adapt)
 
 Three files in one directory train a FashionMNIST classifier. Copy the exact shapes.
@@ -419,5 +490,8 @@ Merged left-to-right; base configs may compose recursively.
   OR / weighted / priority mode, so multi-metric saves are rare. Each entry takes
   `mode: directional` (`value: high|low`) or `mode: tolerance` (`value:` + `direction:`);
   `metrics_on: { metric: test_set }` routes a metric to a specific test set.
+- A config with a **`model:`** section (and no `net:`) is the fit/predict **estimator** path
+  (trees / tabular FMs) — no `optimizer`/`loss`/`dataloaders`; the objective lives in
+  `model.config`. A `net:` config is the image/SGD path. `echelon3 train` routes on this.
 - Config loading is OmegaConf (not Hydra); `${oc.env:VAR,default}` works; `defaults:`
   composes and `hydra:` blocks are ignored.
