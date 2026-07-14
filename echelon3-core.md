@@ -29,6 +29,66 @@ pip install echelon3
    `trainer:` also needs `module` + `type` + `config` (`echelon3.trainers.baseline` /
    `Trainer`).
 
+## The component model (how everything is built)
+
+One rule builds **every** section: `getattr(import_module(module), type)(**config)`.
+
+- `module` is a dotted import path **or** a path to a `.py` file (so zoo/project code
+  drops in without installation). `type` is the attribute (class or function) in it.
+- If `type` is a **class**, echelon3 calls `Class(**config)`. If it is a **function**,
+  echelon3 uses `functools.partial(fn, **config)` (e.g. a metric or collate function).
+- The `config:` block is **optional everywhere** — omit it and the constructor is
+  called with no extra args (`config: {}` and no `config:` are equivalent).
+
+Beyond your `config:`, echelon3 **injects** extra constructor kwargs per section. Your
+class must accept them (they arrive by keyword), or you get a `TypeError` at build time:
+
+| Section | echelon3 calls | Injected beyond your `config:` |
+|---|---|---|
+| `net` | `Net(**config)` | — |
+| `loss` (list item) | `Loss(**config)` | paired with `weight` (default `1.0`) |
+| `metrics` (list item) | `Metric(**config)` (class) | — — for `train` a metric must be an **object** with `.to()`/`update`/`compute`/`reset` (subclass `Metric` or a `torchmetrics.Metric`); a bare function/`partial` only works under `evaluate` |
+| `optimizer` | `Opt(params=…, **config)` | model params; `config.trainable_only: true` keeps only `requires_grad` params |
+| `scheduler` | `Sched(optimizer=…, **config)` | the optimizer |
+| `data.train` / `data.test` | `Dataset(**config, augment=…, preprocess=…)` | **`augment` + `preprocess`** (built from `transform:`) |
+| `dataloaders.*` | `DataLoader(dataset=…, **config)` | the dataset; under DDP also a `DistributedSampler`, split `batch_size`, and a `worker_init_fn` |
+| `trainer` | `Trainer(**config, net=…, optimizer=…, …)` | net, optimizer, both dataloaders, losses, metrics, scheduler, ckpt_manager, mlops_logger, device |
+| `target` | `CheckpointManager(**config)` | — (`path`, `checkpoints_to_keep` passed verbatim) |
+| `evaluator` (`evaluate`) | `Ev(**config, net=…, dataloader=…, metric=…, preprocess=…, postprocess=…)` | net, test loader, the chosen metric, pre/postprocess |
+| `export.exporters.*` (`export`) | `Ex(**config, net=…, preprocess=…, postprocess=…)` | net, pre/postprocess |
+| `runner` (`run`) | `Runner(**config)` then `.process(model, preprocess, postprocess)` | — |
+
+## Component contract (signatures echelon3 calls — mismatches fail at runtime)
+
+- **Dataset** — `__init__` **must accept `augment=` and `preprocess=`** (always injected),
+  alongside your `config:` kwargs. `__getitem__` returns a `(source, label)` pair. You are
+  responsible for **applying** augment/preprocess (echelon3 only constructs and hands them
+  in):
+  ```python
+  # augment: an albumentations Compose that ENDS with ToTensorV2 -> returns a CHW tensor.
+  # preprocess: an nn.Sequential (or None) applied to that tensor.
+  img = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB)   # HWC uint8 numpy
+  if self.augment is not None:
+      img = self.augment(image=img)["image"]                # classification
+      # segmentation: t = self.augment(image=img, mask=mask); img, label = t["image"], t["mask"].long()
+      # detection:    t = self.augment(image=img, bboxes=boxes); img, label = t["image"], t["bboxes"]
+  if self.preprocess is not None:
+      img = self.preprocess(img)
+  return img, label
+  ```
+  (Simple datasets may ignore augment/preprocess and return an already-made tensor — but
+  the two kwargs must still be in the signature. See the FashionMNIST example below.)
+- **Net** — called `net(source) -> predictions`, where `source` is the dataset's first
+  return value after collation + device move. For the baseline trainer `predictions` is a
+  tensor; multi-head / pair trainers use dict / tuple shapes (see **Trainers**).
+- **Loss** — each named loss is called `loss(predictions, labels) -> scalar tensor`;
+  echelon3 sums them weighted by `weight`. `labels` are cast to float first if the trainer
+  has `float_labels: true`.
+- **Metric** — torchmetrics-style: `metric.update(predictions, labels)` per batch, then
+  `metric.compute() -> scalar`, and `reset()` between validations. Subclass
+  `echelon3.metrics.base.Metric` for custom ones (see the cookbook), or use any
+  `torchmetrics.Metric`.
+
 ## CLI
 
 One executable, `echelon3`, with a subcommand per task. Run it from your repo root
@@ -74,9 +134,11 @@ trainer:
   config:
     epochs: 100
     keep_best_on: { iou: { mode: directional, value: high } }   # optional; multi-metric = AND (see Gotchas)
+    metrics_on: { iou: test }  # optional: route a metric to a named test set
     precision: auto            # auto|bf16|fp16|fp32 (auto = bf16 on capable GPUs)
     compile: false             # torch.compile
     times_to_validate_per_epoch: 1
+    float_labels: false        # cast labels to float before the loss
 target: { path: ${oc.env:OUT,./targets/run}, checkpoints_to_keep: 2 }
 gpus: [0]                      # optional; default = all visible GPUs (multi -> DDP)
 device: cuda                   # cuda|cpu. gpus wins for the index.
@@ -86,6 +148,63 @@ Optional sections: `transform`, `metrics`, `scheduler`, `mlops`, `gpus`,
 `keep_best_on`. Required: `data`, `dataloaders`, `net`, `loss`, `optimizer`,
 `trainer`, `target`. Every component needs its `config:` block (`config: {}` if the
 constructor takes no args).
+
+**Multiple test sets:** `data.test` (and `dataloaders.test`) may be a dict of named
+sets instead of one component; the trainer validates each and prints one line per set.
+```yaml
+data:
+  train: { ... }
+  test:
+    incidents: { module: ..., type: ..., config: { ... } }
+    control:   { module: ..., type: ..., config: { ... } }
+```
+
+## Transforms (`augment` + `preprocess`)
+
+`transform:` has `train:` and `test:` purposes, each with optional `augment:` and
+`preprocess:`. echelon3 builds them and injects them into the matching dataset.
+
+```yaml
+transform:
+  train:
+    augment:                 # albumentations ops, applied in listed order; ToTensorV2 is auto-appended
+      flip:  { module: albumentations, type: HorizontalFlip, config: { p: 0.5 } }
+      blur:  { module: albumentations, type: GaussianBlur,   config: { p: 0.2 } }
+    preprocess:              # nn.Module chain applied AFTER augment; each entry needs a `name`
+      norm: { module: torchvision.transforms, type: Normalize, name: norm,
+              config: { mean: [0.485,0.456,0.406], std: [0.229,0.224,0.225] } }
+  test:
+    augment: {}              # empty -> just ToTensorV2
+```
+
+- `augment` → an albumentations `A.Compose([... , ToTensorV2()])`. For detection, put
+  `bbox_params` under the purpose's `config`.
+- **Dtype/scale:** the auto-appended `ToTensorV2` only transposes HWC→CHW — it does **not**
+  divide by 255 or cast to float (unlike `torchvision.ToTensor`). For real images add an
+  `A.Normalize` op to `augment` (it converts to float and scales) **before** `ToTensorV2`,
+  or cast/scale yourself in `__getitem__`; feeding a uint8 tensor into a float net or a
+  `Normalize` preprocess otherwise mis-scales or errors.
+- `preprocess` → a `torch.nn.Sequential`; each entry is a normal component **plus** a
+  `name:` field (used as the layer key). Omit `transform:` entirely and datasets get a
+  bare `ToTensorV2` augment and no preprocess.
+
+## Trainers
+
+- `echelon3.trainers.baseline.Trainer` — the default. Single-tensor `predictions`;
+  `loss(pred, label)`, `metric.update(pred, label)`.
+- `echelon3.trainers.multihead.MultiHeadTrainer` — for **dict-shaped** predictions and
+  labels (multi-head nets); losses/metrics are keyed per head.
+- `echelon3.trainers.pair.PairTrainer` — for **two-image** ("pair" / image-in-image)
+  inputs: the dataset returns `((base, query), gt)` and a pair collate keeps the two
+  images together as the net input `(B_base, B_query)`.
+
+Common `trainer.config` keys: `epochs`, `times_to_validate_per_epoch`,
+`keep_best_on`, `metrics_on`, `precision` (`auto|bf16|fp16|fp32`), `compile`
+(+`compile_mode`), `high_is_better`, `float_labels`.
+
+At start echelon3 runs an **initial validation before training** (the step-0 / loaded
+checkpoint baseline the run must beat), then trains; each validation prints
+`--> Trained epoch N: …% …, lr=…, <losses>` and `--> Evaluated [set]: <losses, metrics>`.
 
 ## Complete minimal example (verified end-to-end — copy and adapt)
 
@@ -142,6 +261,59 @@ Run from that directory:
 echelon3 train -cd . -cn fmnist device=cpu
 ```
 
+## Custom components cookbook
+
+Every one of these is referenced from YAML by `module`/`type`/`config` and needs no
+registration. Run `echelon3` from the repo root so the import path resolves.
+
+**Net** — a plain `nn.Module`; `forward(source) -> predictions`. `config:` = its
+`__init__` kwargs.
+```python
+class MyNet(nn.Module):
+    def __init__(self, channels=32): ...
+    def forward(self, x): return self.head(self.body(x))
+```
+
+**Dataset** — accept `augment`/`preprocess`, return `(source, label)` (apply them as in
+the contract above if you take raw images):
+```python
+class MyDataset(Dataset):
+    def __init__(self, root, split="train", augment=None, preprocess=None):
+        self.augment, self.preprocess = augment, preprocess
+        ...
+    def __len__(self): ...
+    def __getitem__(self, i):
+        img = cv2.cvtColor(cv2.imread(self.paths[i]), cv2.COLOR_BGR2RGB)
+        if self.augment is not None:   img = self.augment(image=img)["image"]  # add A.Normalize to augment: ToTensorV2 keeps uint8
+        if self.preprocess is not None: img = self.preprocess(img)
+        return img, self.labels[i]
+```
+
+**Loss** — any callable `loss(pred, label) -> scalar tensor` (an `nn.Module` or a
+function). Weighted-summed with the others.
+
+**Metric** — subclass `echelon3.metrics.base.Metric`. Keep counters as **tensors on the
+data's device** and, under DDP, SUM-reduce **all** of them (validation is sharded per
+rank, so every counter is partial — reducing only some gives a wrong global value):
+```python
+from echelon3.metrics.base import Metric, all_reduce_sum_
+class Accuracy(Metric):
+    def __init__(self): self.reset()
+    def reset(self):
+        self.correct = torch.zeros((), dtype=torch.float64)
+        self.total   = torch.zeros((), dtype=torch.float64)
+    def update(self, predicted, target):
+        dev = target.device                          # follow the batch onto its device
+        self.correct = self.correct.to(dev) + (predicted.argmax(-1) == target).sum()
+        self.total   = self.total.to(dev)   + target.numel()
+    def compute(self): return (self.correct / self.total.clamp(min=1)).item()
+    def dist_reduce(self):                            # DDP: sum BOTH shard counters
+        all_reduce_sum_(self.correct, self.total)    # (NCCL needs CUDA tensors — hence .to(dev))
+```
+(Any `torchmetrics.Metric` also works — it self-aggregates under DDP, no `dist_reduce`
+needed. A plain function is NOT a valid training metric: the trainer calls `.to(device)`
+on every metric, which a function lacks — see the metrics row in the injection table.)
+
 ## CLI overrides
 
 `key=value` positionals override config values (dotted paths, OmegaConf-typed):
@@ -174,13 +346,14 @@ Merged left-to-right; base configs may compose recursively.
 
 - **DDP**: `gpus=[0,1,2,3]` spawns one process per GPU (built-in launcher, no
   `torchrun`). `dataloaders.*.config.batch_size` is the **global** batch (split across
-  ranks). `num_workers`/`prefetch_factor` are **per-rank** — watch host RAM.
+  ranks, so it must divide by the GPU count). `num_workers`/`prefetch_factor` are
+  **per-rank** — watch host RAM.
 - **Single GPU**: `gpus=[1]` runs on physical GPU 1; `device=cpu` forces CPU.
 - **Precision**: bf16 autocast by default on capable GPUs; `trainer.config.precision:
   fp32` disables AMP; `fp16` uses a GradScaler.
 - **compile**: `trainer.config.compile: true` (+ `compile_mode`) for launch-bound nets.
 
-## Common recipes
+## Checkpoints, resume, finetune
 
 - **Resume (continue a run):** automatic — `echelon3 train` continues if `target.path`
   already has checkpoints (optimizer + scheduler + epoch state are restored).
@@ -194,38 +367,43 @@ Merged left-to-right; base configs may compose recursively.
     type: MyNet
     config: { ... }
     weights: ./runs/base/checkpoint-40.tar   # triggers weight load in `echelon3 train`
-  weights_loader:                            # strict full load
-    module: echelon3.weightloaders.basic
-    type: WeightsLoader
-    config: {}
-    # tolerant partial load (name+shape match, strict=False):
-    # module: echelon3.weightloaders.partial
-    # type: PartialWeightsLoader
-    # config: { strip_prefix: "module." }    # optional: strip a key prefix
+  weights_loader:
+    # Use PartialWeightsLoader for an echelon3 checkpoint .tar: it unwraps the
+    # {model_state_dict, optimizer_state_dict, ...} tar and loads matching name+shape
+    # keys (strict=False), so it also survives architecture changes.
+    module: echelon3.weightloaders.partial
+    type: PartialWeightsLoader
+    config: { strip_prefix: "module." }      # optional: strip a key prefix (e.g. DDP "module.")
+    # WeightsLoader (echelon3.weightloaders.basic) does a STRICT load of a RAW state_dict
+    # file (torch.save(model.state_dict())) — it does NOT understand an echelon3 .tar.
   ```
 - **Finetune (only when you need freeze / per-layer LRs):** `echelon3 finetune` +
   `init_from.checkpoint` (warm-start), `finetune.freeze_patterns` (regex freeze),
   `finetune.head_only` / `finetune.param_groups`. If you just want to start from
   weights, use plain `train` above.
-- **Evaluate**: `echelon3 evaluate` loads the latest checkpoint, runs `evaluator.metric`
-  over `data.test`.
-- **Export ONNX**: `echelon3 export` runs the `export` section (preprocess→net→
-  postprocess into one graph). Needs `echelon3[export]`.
 
-## Extending with your own code
+## evaluate / export / run
 
-Write a normal `nn.Module` / `Dataset` / loss in your repo and reference it by import
-path — no registration:
-
-```yaml
-net: { module: my_pkg.nets.my_net, type: MyNet, config: { channels: 32 } }
-```
-
-Run `echelon3 <cmd>` from the repo root so `my_pkg` imports.
+- **`evaluate`** — score the latest checkpoint. Reads `net`, `target` (loads latest
+  ckpt), `transform.test`, `data.test`, `dataloaders.test`, `metrics`, and
+  `evaluator: { module, type, config, metric: <name> }` — `evaluator.metric` picks **one**
+  metric by name from the `metrics` list; the evaluator runs it over the test set.
+  Note: unlike `train`, `evaluate` requires a **single** `data.test`/`dataloaders.test`
+  (not a named-dict of sets) and expects `transform.test.preprocess` to be present.
+- **`export`** — serialize to ONNX (needs `echelon3[export]`). Reads `net`, optional
+  `target` (load weights), and an `export:` section with optional `preprocess:` /
+  `postprocess:` chains and an `exporters:` dict of named exporter components; each
+  exporter's `.export()` writes one graph (preprocess→net→postprocess).
+- **`run`** — inference over images / video. Reads `net`, optional `target`, reuses
+  `export.preprocess` / `export.postprocess` (and optional `export.wrapper`), plus a
+  `runner:` component whose `.process(model, preprocess, postprocess)` does the work.
+  Honors `precision` / `tf32` / `cudnn_benchmark`.
 
 ## Gotchas
 
 - Every component block needs a `config:` (empty `{}` is fine).
+- Datasets **must** accept `augment=`/`preprocess=` even if unused (echelon3 always
+  passes them); a preprocess entry needs a `name:` field.
 - `gpus` sets the GPU index for single-GPU too; `device: cpu` overrides.
 - `Ctrl-C` stops cleanly (exit 130, no traceback), including under DDP.
 - Under DDP, custom `echelon3.metrics.base.Metric` subclasses only see rank 0's shard
