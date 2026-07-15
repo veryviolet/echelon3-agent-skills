@@ -280,7 +280,13 @@ trainer: { module: echelon3.trainers.estimator, type: MultiTargetEstimatorTraine
 live in the **`echelon3_zoo`** package (`pip install "echelon3-zoo[molecular]"`, pulls rdkit):
 `echelon3_zoo.molecular.SmilesFeaturizer` (RDKit descriptors + Morgan, as a `feature_transform`)
 and `echelon3_zoo.molecular.MoleculeGraphDataset` + `echelon3_zoo.nets.mol_gcn.MolGCN` (a 2D GNN
-that runs on the ordinary SGD `Trainer`).
+that runs on the ordinary SGD `Trainer`). The **`[docking]`** extra adds protein-ligand **pose
+prediction**: `echelon3_zoo.docking` (`DockingComplexDataset` / `PoseBustersDataset` /
+`PDBBindDataset` for PDBBind/PoseBusters complexes, `DockingCollate`), metrics in
+`echelon3_zoo.docking.metrics` (`RMSD` / `SuccessRate2A` / `CentroidRMSD`), loss
+`echelon3_zoo.docking.loss.CoordMSELoss`, and net `echelon3_zoo.nets.egnn.EGNN` — on the
+ordinary SGD `Trainer`, with `DockingCollate` set as the `dataloaders.*.config.collate_fn`
+component for the variable-size complexes.
 
 ## Complete minimal example (verified end-to-end — copy and adapt)
 
@@ -493,5 +499,8 @@ Merged left-to-right; base configs may compose recursively.
 - A config with a **`model:`** section (and no `net:`) is the fit/predict **estimator** path
   (trees / tabular FMs) — no `optimizer`/`loss`/`dataloaders`; the objective lives in
   `model.config`. A `net:` config is the image/SGD path. `echelon3 train` routes on this.
+- For **variable-size / graph batches** (sets, molecular complexes), set a custom collate as
+  a component: `dataloaders.*.config.collate_fn: { module, type, config }` — echelon3 builds it
+  into the DataLoader's `collate_fn` (a plain dict there would break the loader).
 - Config loading is OmegaConf (not Hydra); `${oc.env:VAR,default}` works; `defaults:`
   composes and `hydra:` blocks are ignored.
