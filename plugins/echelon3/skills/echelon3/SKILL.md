@@ -502,5 +502,9 @@ Merged left-to-right; base configs may compose recursively.
 - For **variable-size / graph batches** (sets, molecular complexes), set a custom collate as
   a component: `dataloaders.*.config.collate_fn: { module, type, config }` — echelon3 builds it
   into the DataLoader's `collate_fn` (a plain dict there would break the loader).
+- `echelon3.data.basic.MultiPartDataset` (mix parts by `share`) must be paired with the
+  `echelon3.dataloaders.multipart.MultiPartDataLoader` — its index is a `(part, sample)` tuple,
+  so a plain `DataLoader` sends int indices and fails (echelon3 raises a clear error). Under DDP
+  it rank-shards the largest part automatically (don't add a `DistributedSampler`).
 - Config loading is OmegaConf (not Hydra); `${oc.env:VAR,default}` works; `defaults:`
   composes and `hydra:` blocks are ignored.
