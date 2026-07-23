@@ -92,7 +92,9 @@ class must accept them (they arrive by keyword), or you get a `TypeError` at bui
 - **Metric** — torchmetrics-style: `metric.update(predictions, labels)` per batch, then
   `metric.compute() -> scalar`, and `reset()` between validations. Subclass
   `echelon3.metrics.base.Metric` for custom ones (see the cookbook), or use any
-  `torchmetrics.Metric`.
+  `torchmetrics.Metric`. A metric that must span **several test sets at once** (e.g.
+  retrieval: a query set against a gallery) subclasses `MultiDatasetMetric` instead — see
+  the cookbook.
 
 ## CLI
 
@@ -163,6 +165,10 @@ data:
     incidents: { module: ..., type: ..., config: { ... } }
     control:   { module: ..., type: ..., config: { ... } }
 ```
+A metric that needs **several** of these sets together (e.g. retrieval: a *query* set
+matched against a *gallery*) can't be expressed per-set — use a `MultiDatasetMetric` (see
+the cookbook): it declares the sets it spans, receives the source-set name in each
+`update`, and computes once over all of them.
 
 ## Transforms (`augment` + `preprocess`)
 
@@ -395,6 +401,55 @@ class Accuracy(Metric):
 (Any `torchmetrics.Metric` also works — it self-aggregates under DDP, no `dist_reduce`
 needed. A plain function is NOT a valid training metric: the trainer calls `.to(device)`
 on every metric, which a function lacks — see the metrics row in the injection table.)
+
+**Cross-dataset metric (`MultiDatasetMetric`)** — for a metric defined over several test
+sets at once (retrieval, query-vs-gallery matching, anything needing cross-set context).
+Declare the sets in `self.datasets`; `update` gets the **source-set name** each batch; the
+trainer `reset()`s once, feeds every declared loader in one pass, then `compute()`s **once**
+after all of them (preceded by a single `dist_reduce()` **under DDP** only; ordinary metrics
+are untouched):
+```python
+import torch
+from echelon3.metrics.base import MultiDatasetMetric, all_gather_cat
+
+class RecallAt1(MultiDatasetMetric):
+    """Recall@1 of a query set against a gallery, matched by label id."""
+    def __init__(self, query_dataset, gallery_dataset):
+        self.datasets = [query_dataset, gallery_dataset]   # test sets this metric spans
+        self._q = query_dataset
+        self.reset()
+    def reset(self):
+        self.qe, self.qi, self.ge, self.gi = [], [], [], []
+    def update(self, predicted, target, dataset):          # `dataset` = source-set name
+        (self.qe if dataset == self._q else self.ge).append(predicted)
+        (self.qi if dataset == self._q else self.gi).append(target)
+    def dist_reduce(self):                                 # DDP: gather full sets on every rank
+        self.qe = [all_gather_cat(torch.cat(self.qe))]; self.qi = [all_gather_cat(torch.cat(self.qi))]
+        self.ge = [all_gather_cat(torch.cat(self.ge))]; self.gi = [all_gather_cat(torch.cat(self.gi))]
+    def compute(self):
+        q, g = torch.cat(self.qe), torch.cat(self.ge)
+        nn = (q @ g.t()).argmax(1)                         # nearest gallery row per query
+        return (torch.cat(self.gi)[nn] == torch.cat(self.qi)).float().mean().item()
+```
+```yaml
+data:
+  test:
+    queries: { module: my_pkg.data, type: Queries, config: {} }
+    gallery: { module: my_pkg.data, type: Gallery, config: {} }
+metrics:
+  - recall1: { module: my_pkg.metrics, type: RecallAt1,
+               config: { query_dataset: queries, gallery_dataset: gallery } }
+trainer: { module: echelon3.trainers.baseline, type: Trainer,
+           config: { keep_best_on: { recall1: { mode: directional, value: high } } } }
+```
+- Every name in `datasets` must be a declared test set and the roster non-empty, else
+  validation raises (no silent empty compute). `keep_best_on` tracks it by name.
+- Console: after the per-set `Evaluated […]` lines, one `Finalizing multi-dataset
+  metrics…` / `Finalized multi-dataset metrics: …` summary.
+- Ordinary vs cross-set signature differs: ordinary metrics get `update(pred, label)`,
+  a `MultiDatasetMetric` gets `update(pred, label, dataset)`. Unlike counter metrics
+  (which SUM-reduce), it `all_gather_cat`s its buffers so `compute()` sees the full sets
+  (DistributedSampler may add a few padding duplicates — dedup by id if you need exactness).
 
 ## CLI overrides
 
