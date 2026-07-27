@@ -207,7 +207,12 @@ transform:
   labels (multi-head nets); losses/metrics are keyed per head.
 - `echelon3.trainers.pair.PairTrainer` — for **two-image** ("pair" / image-in-image)
   inputs: the dataset returns `((base, query), gt)` and a pair collate keeps the two
-  images together as the net input `(B_base, B_query)`.
+  images together as the net input `(B_base, B_query)`. To `evaluate` a pair model, use its
+  counterpart `echelon3.evaluators.pair.PairEvaluator` (since 0.10.5) — the generic
+  `evaluator` calls `net(single_input)` and can't feed a pair net; `PairEvaluator` mirrors
+  PairTrainer's forward and feeds the chosen metric the same `(prediction, gt)` it sees in
+  training validation. Config: `evaluator: { module: echelon3.evaluators.pair, type:
+  PairEvaluator, config: { return_features: false }, metric: <name> }`.
 
 Common `trainer.config` keys: `epochs`, `times_to_validate_per_epoch`,
 `keep_best_on`, `metrics_on`, `precision` (`auto|bf16|fp16|fp32`), `compile`
