@@ -532,9 +532,11 @@ Merged left-to-right; base configs may compose recursively.
 - **`evaluate`** — score the latest checkpoint. Reads `net`, `target` (loads latest
   ckpt), `transform.test`, `data.test`, `dataloaders.test`, `metrics`, and
   `evaluator: { module, type, config, metric: <name> }` — `evaluator.metric` picks **one**
-  metric by name from the `metrics` list; the evaluator runs it over the test set.
-  Note: unlike `train`, `evaluate` requires a **single** `data.test`/`dataloaders.test`
-  (not a named-dict of sets) and expects `transform.test.preprocess` to be present.
+  metric by name from the `metrics` list; the evaluator runs it over each test set.
+  `data.test`/`dataloaders.test` may be a single set OR a named dict of sets (same two
+  formats as `train`, since 0.10.4): a named dict is evaluated per set (each paired with its
+  `dataloaders.test` entry, a fresh metric per set) and prints `Validation [name] …`. Expects
+  `transform.test.preprocess` to be present.
 - **`export`** — serialize to ONNX (needs `echelon3[export]`). Reads `net`, optional
   `target` (load weights), and an `export:` section with optional `preprocess:` /
   `postprocess:` chains and an `exporters:` dict of named exporter components; each
