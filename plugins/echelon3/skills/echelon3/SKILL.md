@@ -493,7 +493,15 @@ Merged left-to-right; base configs may compose recursively.
 ## Checkpoints, resume, finetune
 
 - **Resume (continue a run):** automatic — `echelon3 train` continues if `target.path`
-  already has checkpoints (optimizer + scheduler + epoch state are restored).
+  already has checkpoints (optimizer + scheduler + epoch state are restored). Because the
+  checkpoint's optimizer state wins, the config's `lr` / `weight_decay` / schedule are
+  **ignored on resume** while *other* config (e.g. `batch_size`) still applies — a silent
+  mix. echelon3 warns for each optimizer hyperparameter the checkpoint overrides.
+- **Continue from the weights but with NEW hyperparameters:** `trainer.config.reset: true`.
+  It keeps the checkpoint **weights** but restarts optimizer / scheduler / epoch from the
+  config, so a changed `lr` / `weight_decay` / schedule actually take effect (this is the
+  direct answer to "resume, but with a different LR"). Not to be confused with
+  `net.weights` below, which loads weights into a *fresh* run.
 - **Start a fresh run from existing weights (plain `train`, NOT finetune):** set
   `net.weights: <ckpt>` plus a `weights_loader` component and run `echelon3 train`.
   Only the weights are loaded; optimizer and scheduler start fresh, so LR warmup /
