@@ -490,6 +490,14 @@ Merged left-to-right; base configs may compose recursively.
   `torchrun`). `dataloaders.*.config.batch_size` is the **global** batch (split across
   ranks, so it must divide by the GPU count). `num_workers`/`prefetch_factor` are
   **per-rank** — watch host RAM.
+- **`find_unused_parameters`**: defaults to `false` (torch's default; since 0.10.6, was
+  `true`). Only nets that leave some parameters out of the loss on a step (branchy /
+  conditional heads) need it — if DDP errors with *"Expected to have finished reduction …
+  enable find_unused_parameters=True"*, set `trainer.config.ddp_find_unused_parameters: true`.
+- **DataLoader worker threads**: each worker is capped to one intra-op thread (since 0.10.6),
+  so `num_workers` workers don't oversubscribe the CPU (which starves the GPU and can slow an
+  epoch several-fold). Override per loader with `dataloaders.<split>.config.threads_per_worker`
+  (default 1) if a heavy `__getitem__` genuinely benefits from intra-op parallelism.
 - **Single GPU**: `gpus=[1]` runs on physical GPU 1; `device=cpu` forces CPU.
 - **Precision**: bf16 autocast by default on capable GPUs; `trainer.config.precision:
   fp32` disables AMP; `fp16` uses a GradScaler.
