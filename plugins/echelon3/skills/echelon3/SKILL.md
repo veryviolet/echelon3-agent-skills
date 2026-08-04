@@ -510,6 +510,12 @@ Merged left-to-right; base configs may compose recursively.
   checkpoint's optimizer state wins, the config's `lr` / `weight_decay` / schedule are
   **ignored on resume** while *other* config (e.g. `batch_size`) still applies — a silent
   mix. echelon3 warns for each optimizer hyperparameter the checkpoint overrides.
+- **Checkpoint epoch/step metadata (since 0.10.7):** the stored `epoch` is the number of
+  **completed** epochs — `0` for the initial pre-training baseline (also saved, and announced
+  when there's no `keep_best_on`), `N` after epoch N. `global_step` is stored too. Resume from
+  a checkpoint of completed epoch N starts epoch `N+1` (a finished epoch is not re-run), and
+  the LR scheduler is reconciled so the schedule continues correctly. Pre-0.10.7 checkpoints
+  (no `global_step`) resume with the old semantics unchanged.
 - **Continue from the weights but with NEW hyperparameters:** `trainer.config.reset: true`.
   It keeps the checkpoint **weights** but restarts optimizer / scheduler / epoch from the
   config, so a changed `lr` / `weight_decay` / schedule actually take effect (this is the
