@@ -498,6 +498,26 @@ Merged left-to-right; base configs may compose recursively.
   so `num_workers` workers don't oversubscribe the CPU (which starves the GPU and can slow an
   epoch several-fold). Override per loader with `dataloaders.<split>.config.threads_per_worker`
   (default 1) if a heavy `__getitem__` genuinely benefits from intra-op parallelism.
+- **DDP too slow? It's often the interconnect, not the code.** On consumer GPUs **without
+  NVLink**, the per-step gradient all-reduce runs over PCIe at a fraction of NVLink bandwidth
+  (~7 GB/s PCIe vs ~47 GB/s NVLink on a 3090); for a **small net** that sync is exposed every
+  step and adding GPUs scales poorly (GPUs can even read 100% util while spinning in
+  all-reduce). Check with `nvidia-smi topo -m` (look for `NV#` = NVLink vs `PIX`/`PHB`/`SYS` =
+  PCIe). Perf levers (all `trainer.config`, since 0.10.8; off by default except
+  `ddp_gradient_as_bucket_view`):
+  - **`grad_accum_steps: N`** — biggest lever when comm-bound: step the optimizer every N
+    micro-batches (effective batch = N × batch_size), and under DDP all-reduce **once per
+    window** instead of every step (`no_sync`) → N× fewer syncs. Bump LR for the larger batch.
+    Not for closure optimizers (SAM/LBFGS).
+  - **`ddp_comm: bf16`** — halve the all-reduce payload (faster sync when comm-bound; sends
+    gradients in reduced precision, so verify results). `none` (default) = full-precision.
+  - **`numa_affinity: true`** — best-effort (Linux) pin of each rank to its GPU's NUMA-node
+    CPUs on multi-socket boxes; a no-op if the GPU→NUMA mapping can't be resolved.
+  - **`ddp_gradient_as_bucket_view: true`** (**default on**) — gradients are bucket views
+    (less memory, small speed win); set `false` to opt out.
+  - Also worth trying **fewer GPUs**: 2 cards on an NVLink pair can beat 8 over PCIe for a small
+    net. And profile it — `trainer.config.profile: { wait: 5, warmup: 3, active: 10, dir: ./prof }`
+    writes a trace splitting compute vs NCCL vs dataloader wait (`stop_after` ends the run after).
 - **Single GPU**: `gpus=[1]` runs on physical GPU 1; `device=cpu` forces CPU.
 - **Precision**: bf16 autocast by default on capable GPUs; `trainer.config.precision:
   fp32` disables AMP; `fp16` uses a GradScaler.
