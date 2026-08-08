@@ -403,6 +403,24 @@ class Accuracy(Metric):
     def dist_reduce(self):                            # DDP: sum BOTH shard counters
         all_reduce_sum_(self.correct, self.total)    # (NCCL needs CUDA tensors — hence .to(dev))
 ```
+**Shortcut (since 0.10.9):** for this exact "sum scalar counters → ratio" shape, declare the
+counter names and skip reset/to/dist_reduce entirely — the base derives all three:
+```python
+class Accuracy(Metric):
+    _counters = ("correct", "total")                  # reset/to/dist_reduce come for free
+    def __init__(self): self.reset()
+    def update(self, predicted, target):
+        dev = target.device                           # update still moves counters onto the device
+        self.correct = self.correct.to(dev) + (predicted.argmax(-1) == target).sum()
+        self.total   = self.total.to(dev)   + target.numel()
+    def compute(self): return (self.correct / self.total.clamp(min=1)).item()
+```
+Leave `_counters` empty for non-counter state (lists, arbitrary tensors) — write `reset` by
+hand (and `dist_reduce` only if that state needs DDP syncing; the inherited no-op is fine
+otherwise). Build-time validation (`create_metrics`) surfaces a `reset()` that throws, or a
+declared `_counters` that `reset()` doesn't create, as a clear error at **construction** —
+not a minute later on the first validation after DDP + `torch.compile`.
+
 (Any `torchmetrics.Metric` also works — it self-aggregates under DDP, no `dist_reduce`
 needed. A plain function is NOT a valid training metric: the trainer calls `.to(device)`
 on every metric, which a function lacks — see the metrics row in the injection table.)
