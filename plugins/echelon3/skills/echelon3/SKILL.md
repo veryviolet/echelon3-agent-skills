@@ -140,7 +140,7 @@ trainer:
   type: Trainer
   config:
     epochs: 100
-    keep_best_on: { iou: { mode: directional, value: high } }   # optional; multi-metric = AND (see Gotchas)
+    keep_best_on: iou         # optional; metric→high / loss→low by default; multi-metric = AND (see Gotchas)
     metrics_on: { iou: test }  # optional: route a metric to a named test set
     precision: auto            # auto|bf16|fp16|fp32 (auto = bf16 on capable GPUs)
     compile: false             # torch.compile
@@ -216,7 +216,7 @@ transform:
 
 Common `trainer.config` keys: `epochs`, `times_to_validate_per_epoch`,
 `keep_best_on`, `metrics_on`, `precision` (`auto|bf16|fp16|fp32`), `compile`
-(+`compile_mode`), `high_is_better`, `float_labels`.
+(+`compile_mode`), `float_labels`.
 
 At start echelon3 runs an **initial validation before training** (the step-0 / loaded
 checkpoint baseline the run must beat), then trains; each validation prints
@@ -463,7 +463,7 @@ metrics:
   - recall1: { module: my_pkg.metrics, type: RecallAt1,
                config: { query_dataset: queries, gallery_dataset: gallery } }
 trainer: { module: echelon3.trainers.baseline, type: Trainer,
-           config: { keep_best_on: { recall1: { mode: directional, value: high } } } }
+           config: { keep_best_on: recall1 } }   # metric → high by default; or { recall1: { direction: high } }
 ```
 - Every name in `datasets` must be a declared test set and the roster non-empty, else
   validation raises (no silent empty compute). `keep_best_on` tracks it by name.
@@ -613,11 +613,20 @@ Merged left-to-right; base configs may compose recursively.
 - Under DDP, custom `echelon3.metrics.base.Metric` subclasses only see rank 0's shard
   for keep-best unless they implement `dist_reduce()` (SUM all-reduce of their
   counters); torchmetrics aggregate automatically.
+- `keep_best_on` direction is **per-name (0.11.0)**: a **loss** defaults to `low` (minimise),
+  a **metric** to `high` (maximise). Forms: bare `keep_best_on: name` / `[a, b]`; shorthand
+  `{name: high|low}`; directional `{name: {direction: high|low}}` (`mode` defaults to
+  `directional`); tolerance `{name: {mode: tolerance, direction: high|low, tolerance_value: 0.1%}}`.
+  Both `mode` and `direction` are optional (per-type default applies). **Migration:** the old
+  global `high_is_better` and the `{name: {value: …}}` key were **removed** and now raise a
+  clear error — replace `value` with `direction` (directional) or `tolerance_value` (tolerance),
+  and delete `high_is_better` (rely on the loss→low / metric→high default, or set `direction`).
 - `keep_best_on` with **several** metrics is combined with **AND**: a checkpoint is
   saved only when **every** listed metric improves on the same validation — there is no
-  OR / weighted / priority mode, so multi-metric saves are rare. Each entry takes
-  `mode: directional` (`value: high|low`) or `mode: tolerance` (`value:` + `direction:`);
-  `metrics_on: { metric: test_set }` routes a metric to a specific test set.
+  OR / weighted / priority mode, so multi-metric saves are rare. A `keep_best_on` key that is
+  neither a declared metric nor loss is a **hard error at build**; a declared key that is never
+  computed at validation (wrong `metrics_on` / test set) **warns loudly** instead of silently
+  never saving. `metrics_on: { metric: test_set }` routes a metric to a specific test set.
 - A config with a **`model:`** section (and no `net:`) is the fit/predict **estimator** path
   (trees / tabular FMs) — no `optimizer`/`loss`/`dataloaders`; the objective lives in
   `model.config`. A `net:` config is the image/SGD path. `echelon3 train` routes on this.
