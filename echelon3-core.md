@@ -1,3 +1,4 @@
+
 # Using echelon3
 
 echelon3 is a config-driven PyTorch training framework: you describe a run in YAML
@@ -13,7 +14,7 @@ pip install echelon3
 
 ## Rules agents get wrong — read first
 
-1. **Every component is three keys `module` + `type` + `config`** — NOT a single
+1. **Components use `module` + `type` + optional `config`** — NOT a single
    dotted `name:`. echelon3 does `getattr(import_module(module), type)(**config)`.
    ```yaml
    net: { module: my_pkg.nets.my_net, type: MyNet, config: { channels: 32 } }   # RIGHT
@@ -87,7 +88,9 @@ class must accept them (they arrive by keyword), or you get a `TypeError` at bui
 - **Metric** — torchmetrics-style: `metric.update(predictions, labels)` per batch, then
   `metric.compute() -> scalar`, and `reset()` between validations. Subclass
   `echelon3.metrics.base.Metric` for custom ones (see the cookbook), or use any
-  `torchmetrics.Metric`.
+  `torchmetrics.Metric`. A metric that must span **several test sets at once** (e.g.
+  retrieval: a query set against a gallery) subclasses `MultiDatasetMetric` instead — see
+  the cookbook.
 
 ## CLI
 
@@ -133,7 +136,7 @@ trainer:
   type: Trainer
   config:
     epochs: 100
-    keep_best_on: { iou: { mode: directional, value: high } }   # optional; multi-metric = AND (see Gotchas)
+    keep_best_on: iou         # optional; metric→high / loss→low by default; multi-metric = AND (see Gotchas)
     metrics_on: { iou: test }  # optional: route a metric to a named test set
     precision: auto            # auto|bf16|fp16|fp32 (auto = bf16 on capable GPUs)
     compile: false             # torch.compile
@@ -146,8 +149,8 @@ device: cuda                   # cuda|cpu. gpus wins for the index.
 
 Optional sections: `transform`, `metrics`, `scheduler`, `mlops`, `gpus`,
 `keep_best_on`. Required: `data`, `dataloaders`, `net`, `loss`, `optimizer`,
-`trainer`, `target`. Every component needs its `config:` block (`config: {}` if the
-constructor takes no args).
+`trainer`, `target`. The component `config:` block is optional when no
+constructor arguments are needed; omitting it is equivalent to `config: {}`.
 
 **Multiple test sets:** `data.test` (and `dataloaders.test`) may be a dict of named
 sets instead of one component; the trainer validates each and prints one line per set.
@@ -158,6 +161,10 @@ data:
     incidents: { module: ..., type: ..., config: { ... } }
     control:   { module: ..., type: ..., config: { ... } }
 ```
+A metric that needs **several** of these sets together (e.g. retrieval: a *query* set
+matched against a *gallery*) can't be expressed per-set — use a `MultiDatasetMetric` (see
+the cookbook): it declares the sets it spans, receives the source-set name in each
+`update`, and computes once over all of them.
 
 ## Transforms (`augment` + `preprocess`)
 
@@ -188,6 +195,73 @@ transform:
   `name:` field (used as the layer key). Omit `transform:` entirely and datasets get a
   bare `ToTensorV2` augment and no preprocess.
 
+### Per-dataset transforms (requires echelon3 >= 0.12.0)
+
+Put `transform` **beside** `module`, `type`, and `config` in each test dataset spec,
+or in a `MultiPartDataset` part. The existing top-level `transform.train` and
+`transform.test` remain the common defaults. No `transform.test.datasets` mapping
+is used. A single non-multipart training dataset still uses `transform.train`.
+
+- Missing `augment` inherits the common augmentation; missing `preprocess` inherits
+  the common preprocessing. The two keys override independently.
+- A present chain replaces the entire common chain, in its listed order. Chains
+  are not concatenated and operations are not merged by name.
+- `augment: {}` (or `null`) removes common image operations but retains the automatic
+  `ToTensorV2`. `preprocess: {}` is an identity chain; `null` disables preprocessing.
+- Omitting `transform`, or using `transform: {}`, inherits both common pipelines.
+- Local augmentation inherits the common bbox format/label fields. To replace or
+  disable them, supply local `transform.config.bbox_params` (or `null`) together
+  with the local `augment` chain.
+- The same resolver is used in initial/intermediate training validation, finetuning,
+  and standalone `evaluate`. The dataset applies preprocessing once; `PairEvaluator`
+  does not apply it again.
+
+```yaml
+transform:
+  train:
+    augment:
+      flip: { module: albumentations, type: HorizontalFlip, config: { p: 0.5 } }
+    preprocess:
+      scale: { module: echelon3.transforms.preprocess.basic, type: To01, name: scale }
+  test:
+    augment:
+      resize: { module: albumentations, type: Resize, config: { height: 256, width: 256 } }
+    preprocess:
+      scale: { module: echelon3.transforms.preprocess.basic, type: To01, name: scale }
+data:
+  train:
+    module: echelon3.data.basic
+    type: MultiPartDataset
+    config:
+      parts:
+        - name: source_a             # optional; unique within this multipart dataset
+          share: 0.5
+          module: my_project.data
+          type: Images
+          config: { split: train_a }
+          transform: { augment: {} } # no random image operations; common preprocess
+        - share: 0.5                # old unnamed parts remain supported
+          module: my_project.data
+          type: Images
+          config: { split: train_b } # inherits both common train pipelines
+  test:
+    standard:
+      module: my_project.data
+      type: Images
+      config: { split: test_a }      # inherits common resize and preprocessing
+    native_size:
+      module: my_project.data
+      type: Images
+      config: { split: test_b }
+      transform: { augment: {} }     # original size, common preprocessing
+```
+
+Multipart parts keep their list order and `share` sampling semantics. Names are
+optional non-empty, unique strings and are available as `dataset.part_names`
+(`None` for unnamed parts). A part can override transforms with or without a name.
+Use `MultiPartDataLoader` for the multipart train dataset and matching named test
+loaders as usual. Datasets still receive and must apply `augment`/`preprocess`.
+
 ## Trainers
 
 - `echelon3.trainers.baseline.Trainer` — the default. Single-tensor `predictions`;
@@ -196,11 +270,16 @@ transform:
   labels (multi-head nets); losses/metrics are keyed per head.
 - `echelon3.trainers.pair.PairTrainer` — for **two-image** ("pair" / image-in-image)
   inputs: the dataset returns `((base, query), gt)` and a pair collate keeps the two
-  images together as the net input `(B_base, B_query)`.
+  images together as the net input `(B_base, B_query)`. To `evaluate` a pair model, use its
+  counterpart `echelon3.evaluators.pair.PairEvaluator` (since 0.10.5) — the generic
+  `evaluator` calls `net(single_input)` and can't feed a pair net; `PairEvaluator` mirrors
+  PairTrainer's forward and feeds the chosen metric the same `(prediction, gt)` it sees in
+  training validation. Config: `evaluator: { module: echelon3.evaluators.pair, type:
+  PairEvaluator, config: { return_features: false }, metric: <name> }`.
 
 Common `trainer.config` keys: `epochs`, `times_to_validate_per_epoch`,
 `keep_best_on`, `metrics_on`, `precision` (`auto|bf16|fp16|fp32`), `compile`
-(+`compile_mode`), `high_is_better`, `float_labels`.
+(+`compile_mode`), `float_labels`.
 
 At start echelon3 runs an **initial validation before training** (the step-0 / loaded
 checkpoint baseline the run must beat), then trains; each validation prints
@@ -387,9 +466,76 @@ class Accuracy(Metric):
     def dist_reduce(self):                            # DDP: sum BOTH shard counters
         all_reduce_sum_(self.correct, self.total)    # (NCCL needs CUDA tensors — hence .to(dev))
 ```
+**Shortcut (since 0.10.9):** for this exact "sum scalar counters → ratio" shape, declare the
+counter names and skip reset/to/dist_reduce entirely — the base derives all three:
+```python
+class Accuracy(Metric):
+    _counters = ("correct", "total")                  # reset/to/dist_reduce come for free
+    def __init__(self): self.reset()
+    def update(self, predicted, target):
+        dev = target.device                           # update still moves counters onto the device
+        self.correct = self.correct.to(dev) + (predicted.argmax(-1) == target).sum()
+        self.total   = self.total.to(dev)   + target.numel()
+    def compute(self): return (self.correct / self.total.clamp(min=1)).item()
+```
+Leave `_counters` empty for non-counter state (lists, arbitrary tensors) — write `reset` by
+hand (and `dist_reduce` only if that state needs DDP syncing; the inherited no-op is fine
+otherwise). Build-time validation (`create_metrics`) surfaces a `reset()` that throws, or a
+declared `_counters` that `reset()` doesn't create, as a clear error at **construction** —
+not a minute later on the first validation after DDP + `torch.compile`.
+
 (Any `torchmetrics.Metric` also works — it self-aggregates under DDP, no `dist_reduce`
 needed. A plain function is NOT a valid training metric: the trainer calls `.to(device)`
 on every metric, which a function lacks — see the metrics row in the injection table.)
+
+**Cross-dataset metric (`MultiDatasetMetric`)** — for a metric defined over several test
+sets at once (retrieval, query-vs-gallery matching, anything needing cross-set context).
+Declare the sets in `self.datasets`; `update` gets the **source-set name** each batch; the
+trainer `reset()`s once, feeds every declared loader in one pass, then `compute()`s **once**
+after all of them (preceded by a single `dist_reduce()` **under DDP** only; ordinary metrics
+are untouched):
+```python
+import torch
+from echelon3.metrics.base import MultiDatasetMetric, all_gather_cat
+
+class RecallAt1(MultiDatasetMetric):
+    """Recall@1 of a query set against a gallery, matched by label id."""
+    def __init__(self, query_dataset, gallery_dataset):
+        self.datasets = [query_dataset, gallery_dataset]   # test sets this metric spans
+        self._q = query_dataset
+        self.reset()
+    def reset(self):
+        self.qe, self.qi, self.ge, self.gi = [], [], [], []
+    def update(self, predicted, target, dataset):          # `dataset` = source-set name
+        (self.qe if dataset == self._q else self.ge).append(predicted)
+        (self.qi if dataset == self._q else self.gi).append(target)
+    def dist_reduce(self):                                 # DDP: gather full sets on every rank
+        self.qe = [all_gather_cat(torch.cat(self.qe))]; self.qi = [all_gather_cat(torch.cat(self.qi))]
+        self.ge = [all_gather_cat(torch.cat(self.ge))]; self.gi = [all_gather_cat(torch.cat(self.gi))]
+    def compute(self):
+        q, g = torch.cat(self.qe), torch.cat(self.ge)
+        nn = (q @ g.t()).argmax(1)                         # nearest gallery row per query
+        return (torch.cat(self.gi)[nn] == torch.cat(self.qi)).float().mean().item()
+```
+```yaml
+data:
+  test:
+    queries: { module: my_pkg.data, type: Queries, config: {} }
+    gallery: { module: my_pkg.data, type: Gallery, config: {} }
+metrics:
+  - recall1: { module: my_pkg.metrics, type: RecallAt1,
+               config: { query_dataset: queries, gallery_dataset: gallery } }
+trainer: { module: echelon3.trainers.baseline, type: Trainer,
+           config: { keep_best_on: recall1 } }   # metric → high by default; or { recall1: { direction: high } }
+```
+- Every name in `datasets` must be a declared test set and the roster non-empty, else
+  validation raises (no silent empty compute). `keep_best_on` tracks it by name.
+- Console: after the per-set `Evaluated […]` lines, one `Finalizing multi-dataset
+  metrics…` / `Finalized multi-dataset metrics: …` summary.
+- Ordinary vs cross-set signature differs: ordinary metrics get `update(pred, label)`,
+  a `MultiDatasetMetric` gets `update(pred, label, dataset)`. Unlike counter metrics
+  (which SUM-reduce), it `all_gather_cat`s its buffers so `compute()` sees the full sets
+  (DistributedSampler may add a few padding duplicates — dedup by id if you need exactness).
 
 ## CLI overrides
 
@@ -425,6 +571,34 @@ Merged left-to-right; base configs may compose recursively.
   `torchrun`). `dataloaders.*.config.batch_size` is the **global** batch (split across
   ranks, so it must divide by the GPU count). `num_workers`/`prefetch_factor` are
   **per-rank** — watch host RAM.
+- **`find_unused_parameters`**: defaults to `false` (torch's default; since 0.10.6, was
+  `true`). Only nets that leave some parameters out of the loss on a step (branchy /
+  conditional heads) need it — if DDP errors with *"Expected to have finished reduction …
+  enable find_unused_parameters=True"*, set `trainer.config.ddp_find_unused_parameters: true`.
+- **DataLoader worker threads**: each worker is capped to one intra-op thread (since 0.10.6),
+  so `num_workers` workers don't oversubscribe the CPU (which starves the GPU and can slow an
+  epoch several-fold). Override per loader with `dataloaders.<split>.config.threads_per_worker`
+  (default 1) if a heavy `__getitem__` genuinely benefits from intra-op parallelism.
+- **DDP too slow? It's often the interconnect, not the code.** On consumer GPUs **without
+  NVLink**, the per-step gradient all-reduce runs over PCIe at a fraction of NVLink bandwidth
+  (~7 GB/s PCIe vs ~47 GB/s NVLink on a 3090); for a **small net** that sync is exposed every
+  step and adding GPUs scales poorly (GPUs can even read 100% util while spinning in
+  all-reduce). Check with `nvidia-smi topo -m` (look for `NV#` = NVLink vs `PIX`/`PHB`/`SYS` =
+  PCIe). Perf levers (all `trainer.config`, since 0.10.8; off by default except
+  `ddp_gradient_as_bucket_view`):
+  - **`grad_accum_steps: N`** — biggest lever when comm-bound: step the optimizer every N
+    micro-batches (effective batch = N × batch_size), and under DDP all-reduce **once per
+    window** instead of every step (`no_sync`) → N× fewer syncs. Bump LR for the larger batch.
+    Not for closure optimizers (SAM/LBFGS).
+  - **`ddp_comm: bf16`** — halve the all-reduce payload (faster sync when comm-bound; sends
+    gradients in reduced precision, so verify results). `none` (default) = full-precision.
+  - **`numa_affinity: true`** — best-effort (Linux) pin of each rank to its GPU's NUMA-node
+    CPUs on multi-socket boxes; a no-op if the GPU→NUMA mapping can't be resolved.
+  - **`ddp_gradient_as_bucket_view: true`** (**default on**) — gradients are bucket views
+    (less memory, small speed win); set `false` to opt out.
+  - Also worth trying **fewer GPUs**: 2 cards on an NVLink pair can beat 8 over PCIe for a small
+    net. And profile it — `trainer.config.profile: { wait: 5, warmup: 3, active: 10, dir: ./prof }`
+    writes a trace splitting compute vs NCCL vs dataloader wait (`stop_after` ends the run after).
 - **Single GPU**: `gpus=[1]` runs on physical GPU 1; `device=cpu` forces CPU.
 - **Precision**: bf16 autocast by default on capable GPUs; `trainer.config.precision:
   fp32` disables AMP; `fp16` uses a GradScaler.
@@ -432,8 +606,27 @@ Merged left-to-right; base configs may compose recursively.
 
 ## Checkpoints, resume, finetune
 
+- **Retention (since 0.12.0):** `target.checkpoints_to_keep` keeps the newest N checkpoint
+  files after each successful save. N must be a positive integer; omitted/null means
+  keep all. Failed saves preserve earlier checkpoints. Opening a target directory alone
+  does not delete files. The initial checkpoint may be pruned; load the latest available.
+
 - **Resume (continue a run):** automatic — `echelon3 train` continues if `target.path`
-  already has checkpoints (optimizer + scheduler + epoch state are restored).
+  already has checkpoints (optimizer + scheduler + epoch state are restored). Because the
+  checkpoint's optimizer state wins, the config's `lr` / `weight_decay` / schedule are
+  **ignored on resume** while *other* config (e.g. `batch_size`) still applies — a silent
+  mix. echelon3 warns for each optimizer hyperparameter the checkpoint overrides.
+- **Checkpoint epoch/step metadata (since 0.10.7):** the stored `epoch` is the number of
+  **completed** epochs — `0` for the initial pre-training baseline (also saved, and announced
+  when there's no `keep_best_on`), `N` after epoch N. `global_step` is stored too. Resume from
+  a checkpoint of completed epoch N starts epoch `N+1` (a finished epoch is not re-run), and
+  the LR scheduler is reconciled so the schedule continues correctly. Pre-0.10.7 checkpoints
+  (no `global_step`) resume with the old semantics unchanged.
+- **Continue from the weights but with NEW hyperparameters:** `trainer.config.reset: true`.
+  It keeps the checkpoint **weights** but restarts optimizer / scheduler / epoch from the
+  config, so a changed `lr` / `weight_decay` / schedule actually take effect (this is the
+  direct answer to "resume, but with a different LR"). Not to be confused with
+  `net.weights` below, which loads weights into a *fresh* run.
 - **Start a fresh run from existing weights (plain `train`, NOT finetune):** set
   `net.weights: <ckpt>` plus a `weights_loader` component and run `echelon3 train`.
   Only the weights are loaded; optimizer and scheduler start fresh, so LR warmup /
@@ -464,9 +657,11 @@ Merged left-to-right; base configs may compose recursively.
 - **`evaluate`** — score the latest checkpoint. Reads `net`, `target` (loads latest
   ckpt), `transform.test`, `data.test`, `dataloaders.test`, `metrics`, and
   `evaluator: { module, type, config, metric: <name> }` — `evaluator.metric` picks **one**
-  metric by name from the `metrics` list; the evaluator runs it over the test set.
-  Note: unlike `train`, `evaluate` requires a **single** `data.test`/`dataloaders.test`
-  (not a named-dict of sets) and expects `transform.test.preprocess` to be present.
+  metric by name from the `metrics` list; the evaluator runs it over each test set.
+  `data.test`/`dataloaders.test` may be a single set OR a named dict of sets (same two
+  formats as `train`, since 0.10.4): a named dict is evaluated per set (each paired with its
+  `dataloaders.test` entry, a fresh metric per set) and prints `Validation [name] …`. Test transforms are optional. Dataset-local overrides use the same resolver
+  as training validation; the selected preprocess is applied by the dataset once.
 - **`export`** — serialize to ONNX (needs `echelon3[export]`). Reads `net`, optional
   `target` (load weights), and an `export:` section with optional `preprocess:` /
   `postprocess:` chains and an `exporters:` dict of named exporter components; each
@@ -478,7 +673,7 @@ Merged left-to-right; base configs may compose recursively.
 
 ## Gotchas
 
-- Every component block needs a `config:` (empty `{}` is fine).
+- `config:` is optional for components with no constructor arguments.
 - Datasets **must** accept `augment=`/`preprocess=` even if unused (echelon3 always
   passes them); a preprocess entry needs a `name:` field.
 - `gpus` sets the GPU index for single-GPU too; `device: cpu` overrides.
@@ -486,11 +681,20 @@ Merged left-to-right; base configs may compose recursively.
 - Under DDP, custom `echelon3.metrics.base.Metric` subclasses only see rank 0's shard
   for keep-best unless they implement `dist_reduce()` (SUM all-reduce of their
   counters); torchmetrics aggregate automatically.
+- `keep_best_on` direction is **per-name (0.11.0)**: a **loss** defaults to `low` (minimise),
+  a **metric** to `high` (maximise). Forms: bare `keep_best_on: name` / `[a, b]`; shorthand
+  `{name: high|low}`; directional `{name: {direction: high|low}}` (`mode` defaults to
+  `directional`); tolerance `{name: {mode: tolerance, direction: high|low, tolerance_value: 0.1%}}`.
+  Both `mode` and `direction` are optional (per-type default applies). **Migration:** the old
+  global `high_is_better` and the `{name: {value: …}}` key were **removed** and now raise a
+  clear error — replace `value` with `direction` (directional) or `tolerance_value` (tolerance),
+  and delete `high_is_better` (rely on the loss→low / metric→high default, or set `direction`).
 - `keep_best_on` with **several** metrics is combined with **AND**: a checkpoint is
   saved only when **every** listed metric improves on the same validation — there is no
-  OR / weighted / priority mode, so multi-metric saves are rare. Each entry takes
-  `mode: directional` (`value: high|low`) or `mode: tolerance` (`value:` + `direction:`);
-  `metrics_on: { metric: test_set }` routes a metric to a specific test set.
+  OR / weighted / priority mode, so multi-metric saves are rare. A `keep_best_on` key that is
+  neither a declared metric nor loss is a **hard error at build**; a declared key that is never
+  computed at validation (wrong `metrics_on` / test set) **warns loudly** instead of silently
+  never saving. `metrics_on: { metric: test_set }` routes a metric to a specific test set.
 - A config with a **`model:`** section (and no `net:`) is the fit/predict **estimator** path
   (trees / tabular FMs) — no `optimizer`/`loss`/`dataloaders`; the objective lives in
   `model.config`. A `net:` config is the image/SGD path. `echelon3 train` routes on this.

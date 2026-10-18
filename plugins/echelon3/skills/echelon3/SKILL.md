@@ -18,7 +18,7 @@ pip install echelon3
 
 ## Rules agents get wrong — read first
 
-1. **Every component is three keys `module` + `type` + `config`** — NOT a single
+1. **Components use `module` + `type` + optional `config`** — NOT a single
    dotted `name:`. echelon3 does `getattr(import_module(module), type)(**config)`.
    ```yaml
    net: { module: my_pkg.nets.my_net, type: MyNet, config: { channels: 32 } }   # RIGHT
@@ -153,8 +153,8 @@ device: cuda                   # cuda|cpu. gpus wins for the index.
 
 Optional sections: `transform`, `metrics`, `scheduler`, `mlops`, `gpus`,
 `keep_best_on`. Required: `data`, `dataloaders`, `net`, `loss`, `optimizer`,
-`trainer`, `target`. Every component needs its `config:` block (`config: {}` if the
-constructor takes no args).
+`trainer`, `target`. The component `config:` block is optional when no
+constructor arguments are needed; omitting it is equivalent to `config: {}`.
 
 **Multiple test sets:** `data.test` (and `dataloaders.test`) may be a dict of named
 sets instead of one component; the trainer validates each and prints one line per set.
@@ -198,6 +198,73 @@ transform:
 - `preprocess` → a `torch.nn.Sequential`; each entry is a normal component **plus** a
   `name:` field (used as the layer key). Omit `transform:` entirely and datasets get a
   bare `ToTensorV2` augment and no preprocess.
+
+### Per-dataset transforms (requires echelon3 >= 0.12.0)
+
+Put `transform` **beside** `module`, `type`, and `config` in each test dataset spec,
+or in a `MultiPartDataset` part. The existing top-level `transform.train` and
+`transform.test` remain the common defaults. No `transform.test.datasets` mapping
+is used. A single non-multipart training dataset still uses `transform.train`.
+
+- Missing `augment` inherits the common augmentation; missing `preprocess` inherits
+  the common preprocessing. The two keys override independently.
+- A present chain replaces the entire common chain, in its listed order. Chains
+  are not concatenated and operations are not merged by name.
+- `augment: {}` (or `null`) removes common image operations but retains the automatic
+  `ToTensorV2`. `preprocess: {}` is an identity chain; `null` disables preprocessing.
+- Omitting `transform`, or using `transform: {}`, inherits both common pipelines.
+- Local augmentation inherits the common bbox format/label fields. To replace or
+  disable them, supply local `transform.config.bbox_params` (or `null`) together
+  with the local `augment` chain.
+- The same resolver is used in initial/intermediate training validation, finetuning,
+  and standalone `evaluate`. The dataset applies preprocessing once; `PairEvaluator`
+  does not apply it again.
+
+```yaml
+transform:
+  train:
+    augment:
+      flip: { module: albumentations, type: HorizontalFlip, config: { p: 0.5 } }
+    preprocess:
+      scale: { module: echelon3.transforms.preprocess.basic, type: To01, name: scale }
+  test:
+    augment:
+      resize: { module: albumentations, type: Resize, config: { height: 256, width: 256 } }
+    preprocess:
+      scale: { module: echelon3.transforms.preprocess.basic, type: To01, name: scale }
+data:
+  train:
+    module: echelon3.data.basic
+    type: MultiPartDataset
+    config:
+      parts:
+        - name: source_a             # optional; unique within this multipart dataset
+          share: 0.5
+          module: my_project.data
+          type: Images
+          config: { split: train_a }
+          transform: { augment: {} } # no random image operations; common preprocess
+        - share: 0.5                # old unnamed parts remain supported
+          module: my_project.data
+          type: Images
+          config: { split: train_b } # inherits both common train pipelines
+  test:
+    standard:
+      module: my_project.data
+      type: Images
+      config: { split: test_a }      # inherits common resize and preprocessing
+    native_size:
+      module: my_project.data
+      type: Images
+      config: { split: test_b }
+      transform: { augment: {} }     # original size, common preprocessing
+```
+
+Multipart parts keep their list order and `share` sampling semantics. Names are
+optional non-empty, unique strings and are available as `dataset.part_names`
+(`None` for unnamed parts). A part can override transforms with or without a name.
+Use `MultiPartDataLoader` for the multipart train dataset and matching named test
+loaders as usual. Datasets still receive and must apply `augment`/`preprocess`.
 
 ## Trainers
 
@@ -543,6 +610,11 @@ Merged left-to-right; base configs may compose recursively.
 
 ## Checkpoints, resume, finetune
 
+- **Retention (since 0.12.0):** `target.checkpoints_to_keep` keeps the newest N checkpoint
+  files after each successful save. N must be a positive integer; omitted/null means
+  keep all. Failed saves preserve earlier checkpoints. Opening a target directory alone
+  does not delete files. The initial checkpoint may be pruned; load the latest available.
+
 - **Resume (continue a run):** automatic — `echelon3 train` continues if `target.path`
   already has checkpoints (optimizer + scheduler + epoch state are restored). Because the
   checkpoint's optimizer state wins, the config's `lr` / `weight_decay` / schedule are
@@ -592,8 +664,8 @@ Merged left-to-right; base configs may compose recursively.
   metric by name from the `metrics` list; the evaluator runs it over each test set.
   `data.test`/`dataloaders.test` may be a single set OR a named dict of sets (same two
   formats as `train`, since 0.10.4): a named dict is evaluated per set (each paired with its
-  `dataloaders.test` entry, a fresh metric per set) and prints `Validation [name] …`. Expects
-  `transform.test.preprocess` to be present.
+  `dataloaders.test` entry, a fresh metric per set) and prints `Validation [name] …`. Test transforms are optional. Dataset-local overrides use the same resolver
+  as training validation; the selected preprocess is applied by the dataset once.
 - **`export`** — serialize to ONNX (needs `echelon3[export]`). Reads `net`, optional
   `target` (load weights), and an `export:` section with optional `preprocess:` /
   `postprocess:` chains and an `exporters:` dict of named exporter components; each
@@ -605,7 +677,7 @@ Merged left-to-right; base configs may compose recursively.
 
 ## Gotchas
 
-- Every component block needs a `config:` (empty `{}` is fine).
+- `config:` is optional for components with no constructor arguments.
 - Datasets **must** accept `augment=`/`preprocess=` even if unused (echelon3 always
   passes them); a preprocess entry needs a `name:` field.
 - `gpus` sets the GPU index for single-GPU too; `device: cpu` overrides.

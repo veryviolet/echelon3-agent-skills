@@ -1,7 +1,7 @@
 {
   "name": "echelon3",
-  "version": "0.1.16",
-  "description": "echelon3 \u2014 config-driven PyTorch training CLI usage skill.",
+  "version": "0.1.17",
+  "description": "echelon3 — config-driven PyTorch training CLI usage skill.",
   "author": {
     "name": "veryviolet"
   }
