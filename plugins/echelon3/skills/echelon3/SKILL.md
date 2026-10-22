@@ -610,6 +610,23 @@ Merged left-to-right; base configs may compose recursively.
 
 ## Checkpoints, resume, finetune
 
+- **Last completed epoch (since 0.13.0, baseline-derived train/finetune):**
+  set `trainer.config.save_last: true` to atomically replace `target.path/last.tar`
+  after each complete epoch, after the scheduler step. This is opt-in (default false).
+  Keep the default `resume_from: latest` for the first run; explicitly set
+  `trainer.config.resume_from: last` when continuing from last. A missing `last.tar`
+  is an error, with no fallback to a numbered checkpoint. Last resume restores
+  model, optimizer, scheduler, scaler, completed epoch, exact global step and best
+  thresholds, and starts epoch N+1 without an extra scheduler step. Initial
+  validation does not promote last to best. `reset: true` still resets training
+  state while retaining the selected weights. Exceptions and partial profiling
+  epochs do not overwrite last. RNG state and partially accumulated gradients are
+  not saved; for accumulation, use an epoch length divisible by `grad_accum_steps`
+  to avoid discarding a partial window. This is not bitwise stochastic replay.
+  `last.tar` is independent of numbered best checkpoints and their retention;
+  default resume, `evaluate` and `export` still select the highest numbered file.
+  Example: `echelon3 train -cd configs -cn experiment trainer.config.resume_from=last`.
+
 - **Retention (since 0.12.0):** `target.checkpoints_to_keep` keeps the newest N checkpoint
   files after each successful save. N must be a positive integer; omitted/null means
   keep all. Failed saves preserve earlier checkpoints. Opening a target directory alone
@@ -681,7 +698,14 @@ Merged left-to-right; base configs may compose recursively.
 - Datasets **must** accept `augment=`/`preprocess=` even if unused (echelon3 always
   passes them); a preprocess entry needs a `name:` field.
 - `gpus` sets the GPU index for single-GPU too; `device: cpu` overrides.
-- `Ctrl-C` stops cleanly (exit 130, no traceback), including under DDP.
+- `Ctrl-C` uses exit 130. Since 0.13.0, DDP shutdown explicitly stops persistent
+  DataLoader iterators even when retained by a traceback and finalizes multiprocessing
+  resources before hard exit. Native crashes still need their own reproducer.
+- **Fatal DDP errors (since 0.13.0, POSIX):** original errors are recorded before
+  cleanup. A kernel deadline bounds the failed rank's diagnostics/cleanup to 20 s,
+  including native calls holding the GIL; broken stderr/error recording cannot bypass
+  terminal exit. Elastic peer shutdown adds its own time, so 20 s is not a whole-job
+  deadline. Logger errors such as ENOSPC remain fatal; fix storage before restarting.
 - Under DDP, custom `echelon3.metrics.base.Metric` subclasses only see rank 0's shard
   for keep-best unless they implement `dist_reduce()` (SUM all-reduce of their
   counters); torchmetrics aggregate automatically.
