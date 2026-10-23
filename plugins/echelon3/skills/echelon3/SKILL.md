@@ -583,6 +583,24 @@ Merged left-to-right; base configs may compose recursively.
   so `num_workers` workers don't oversubscribe the CPU (which starves the GPU and can slow an
   epoch several-fold). Override per loader with `dataloaders.<split>.config.threads_per_worker`
   (default 1) if a heavy `__getitem__` genuinely benefits from intra-op parallelism.
+- **DataLoader worker CPU affinity (since 0.14.0, Linux):** set
+  `dataloaders.*.config.worker_cpu_affinity: launcher` to use the original CLI
+  CPU mask inside workers, or an explicit list such as `[0, 1, 2, 3]` to select
+  a subset of that allocation. Omitted/null preserves inherited affinity.
+  Applies independently to train, finetune, named test loaders and standalone
+  evaluate. The built-in launcher carries the mask captured before CUDA/DDP
+  setup into every rank; rank/NCCL placement itself remains unchanged. Thus
+  GPU-local ranks can coexist with workers using both CPU sockets.
+  With external `torchrun`, the reference mask is each rank's mask at engine
+  entry; a wider allocation already removed by that launcher cannot be recovered.
+  Explicit lists must be non-empty non-negative integer CPU IDs within the
+  captured mask; invalid IDs and kernel-restricted partial masks raise errors.
+  This setting is validated even at `num_workers: 0`, where it has no placement
+  effect. All workers of a loader share its pool: use disjoint allowed CPU lists
+  for separate jobs when desired; there is no automatic rank/job partitioning.
+  Applied before thread-pool setup and user worker-init callbacks, with fork or
+  spawn. CPU affinity controls placement, not memory binding, and does not by
+  itself diagnose earlier CPU-mask changes or guarantee higher throughput.
 - **DDP too slow? It's often the interconnect, not the code.** On consumer GPUs **without
   NVLink**, the per-step gradient all-reduce runs over PCIe at a fraction of NVLink bandwidth
   (~7 GB/s PCIe vs ~47 GB/s NVLink on a 3090); for a **small net** that sync is exposed every
