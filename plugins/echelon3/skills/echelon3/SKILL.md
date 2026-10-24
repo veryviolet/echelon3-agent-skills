@@ -579,6 +579,25 @@ Merged left-to-right; base configs may compose recursively.
   `true`). Only nets that leave some parameters out of the loss on a step (branchy /
   conditional heads) need it — if DDP errors with *"Expected to have finished reduction …
   enable find_unused_parameters=True"*, set `trainer.config.ddp_find_unused_parameters: true`.
+- **Slow second/later validation start:** the trainer reuses the model, datasets and
+  DataLoader objects, but `persistent_workers: false` recreates worker processes
+  on every validation pass. The native DDP launcher uses `spawn`, so imports and
+  dataset deserialization recur before the first batch. For frequent validation
+  (especially `times_to_validate_per_epoch > 1`), prefer
+  `dataloaders.test.<name>.config.persistent_workers: true` when `num_workers > 0`;
+  for a single unnamed test loader use `dataloaders.test.config.persistent_workers`.
+  Example CLI override: `dataloaders.test.real.config.persistent_workers=true`.
+  Train defaults to persistent workers at `num_workers > 0`; test preserves the
+  configured value (PyTorch defaults to false). Configure each named test loader
+  independently. Do not set true with `num_workers: 0`.
+  Persistence retains worker processes and their dataset state in host RAM between
+  validations, alongside train workers; it does not cache processed samples or
+  predictions. Worker-local RNG/state persists too: deterministic test data should
+  seed by sample rather than depend on worker restart. False remains useful when
+  releasing worker RAM between infrequent validations matters more than startup.
+  Separate `echelon3 evaluate` CLI invocations rebuild their objects; persistence
+  cannot carry workers across processes. Compare second/later first-batch latency
+  and worker PID reuse before attributing a pause to model reconstruction.
 - **DataLoader worker threads**: each worker is capped to one intra-op thread (since 0.10.6),
   so `num_workers` workers don't oversubscribe the CPU (which starves the GPU and can slow an
   epoch several-fold). Override per loader with `dataloaders.<split>.config.threads_per_worker`
