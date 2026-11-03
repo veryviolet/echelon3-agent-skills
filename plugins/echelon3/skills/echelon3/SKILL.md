@@ -16,6 +16,11 @@ pip install echelon3
 # extras: echelon3[export] (ONNX), echelon3[smp], echelon3[detection], echelon3[test]
 ```
 
+Project environments must use published PyPI releases of echelon3. Development
+branches and pre-release wheels are for isolated engine testing, not project runs.
+When a project needs an engine fix, release and verify it on PyPI before recommending
+or installing it there; do not update an active training environment in place.
+
 ## Rules agents get wrong — read first
 
 1. **Components use `module` + `type` + optional `config`** — NOT a single
@@ -640,6 +645,11 @@ Merged left-to-right; base configs may compose recursively.
   - Also worth trying **fewer GPUs**: 2 cards on an NVLink pair can beat 8 over PCIe for a small
     net. And profile it — `trainer.config.profile: { wait: 5, warmup: 3, active: 10, dir: ./prof }`
     writes a trace splitting compute vs NCCL vs dataloader wait (`stop_after` ends the run after).
+    Since 0.14.1, partial profiling epochs report actual completed batches and do not
+    step the epoch scheduler or save `last.tar`. Normal profile stops finish already
+    dispatched DataLoader prefetch and check worker exits; prefetch failures propagate.
+    This is not a blanket fix for native CUDA `terminate` errors: diagnose those with
+    their reproducer instead of assuming a successful profiler test proves the cause.
 - **Single GPU**: `gpus=[1]` runs on physical GPU 1; `device=cpu` forces CPU.
 - **Precision**: bf16 autocast by default on capable GPUs; `trainer.config.precision:
   fp32` disables AMP; `fp16` uses a GradScaler.
@@ -720,6 +730,15 @@ Merged left-to-right; base configs may compose recursively.
   formats as `train`, since 0.10.4): a named dict is evaluated per set (each paired with its
   `dataloaders.test` entry, a fresh metric per set) and prints `Validation [name] …`. Test transforms are optional. Dataset-local overrides use the same resolver
   as training validation; the selected preprocess is applied by the dataset once.
+  **Device selection (since 0.14.1):** root `device: cpu` avoids CUDA probing and
+  autocast, even on a CUDA host. Root `device: cuda` with `gpus: [6]` binds GPU 6
+  before network construction and AMP capability checks. Checkpoints deserialize
+  on CPU regardless of saved GPU tags; only model weights move to the selected
+  device. Built-in evaluators use it for metrics and inputs too. Standalone evaluate
+  uses one GPU (`gpus[0]`), not DDP; indices refer to CUDA-visible devices. Custom
+  evaluators accepting `device`/`**kwargs` receive the root selection at construction;
+  legacy closed-signature evaluators remain callable but own their device handling.
+  Use a released version >=0.14.1 for this behavior, not 0.14.0 or a development wheel.
 - **`export`** — serialize to ONNX (needs `echelon3[export]`). Reads `net`, optional
   `target` (load weights), and an `export:` section with optional `preprocess:` /
   `postprocess:` chains and an `exporters:` dict of named exporter components; each
