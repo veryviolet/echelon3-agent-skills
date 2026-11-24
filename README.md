@@ -24,9 +24,19 @@ Verified: `codex plugin list` → `echelon3@veryviolet  installed, enabled`.
 
 Verified: `claude plugin details echelon3` → `Skills (1) echelon3`.
 
+## Kimi Code
+
+```bash
+/plugins install https://github.com/veryviolet/echelon3-agent-skills
+/reload
+```
+
+The root `kimi.plugin.json` exposes the same shared skill to Kimi Code.
+
 ## Layout
 
 ```
+kimi.plugin.json                         # Kimi Code plugin manifest
 .agents/plugins/marketplace.json         # Codex marketplace
 .claude-plugin/marketplace.json          # Claude marketplace
 plugins/echelon3/
