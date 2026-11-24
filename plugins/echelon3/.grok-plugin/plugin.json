@@ -1,0 +1,18 @@
+{
+  "name": "echelon3",
+  "version": "0.1.23",
+  "description": "echelon3 — config-driven PyTorch training CLI usage skill.",
+  "author": {
+    "name": "veryviolet",
+    "url": "https://github.com/veryviolet"
+  },
+  "homepage": "https://github.com/veryviolet/echelon3",
+  "repository": "https://github.com/veryviolet/echelon3",
+  "license": "Apache-2.0",
+  "keywords": [
+    "echelon3",
+    "pytorch",
+    "training",
+    "config-driven"
+  ]
+}
